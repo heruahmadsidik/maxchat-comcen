@@ -1,0 +1,7 @@
+{
+  "apiToken": "apimaxchat",
+  "webhookUrl": "https://test/webhook",
+  "loginUsername": "admin",
+  "loginPassword": "admin@123",
+  "settingsPassword": "124578"
+}
