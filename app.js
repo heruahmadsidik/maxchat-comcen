@@ -584,6 +584,13 @@ async function maybeRunScheduledBackup() {
 const NON_BROADCAST_TEMPLATES = ['📥 PESAN MASUK', '💬 Balasan Manual', '📎 File Terkirim', '📤 PESAN KELUAR (SYNC)', 'Balasan Manual'];
 const NON_BROADCAST_PLACEHOLDERS = NON_BROADCAST_TEMPLATES.map(() => '?').join(',');
 
+// Template yang dihitung sebagai "balasan manual" murni (chat bebas dari menu
+// Chat / tombol Balasan Manual di Broadcast) — dipakai untuk hitungan kuota
+// gratis WhatsApp (1000 pesan pertama/bulan gratis, selebihnya Rp 365/pesan).
+const MANUAL_REPLY_TEMPLATES = ['💬 Balasan Manual', 'Balasan Manual'];
+const MANUAL_REPLY_PLACEHOLDERS = MANUAL_REPLY_TEMPLATES.map(() => '?').join(',');
+const MANUAL_REPLY_FREE_QUOTA = 1000; // pesan gratis per bulan kalender (WIB)
+
 function getDbInfo() {
   let dbSizeBytes = 0;
   // Ukuran database dihitung dari file utama + WAL/SHM (mode journal WAL
@@ -654,6 +661,60 @@ function getBroadcastDailyHistory(days, groupBy) {
     LIMIT ?
   `).all(...NON_BROADCAST_TEMPLATES, days);
   return rows.map(r => ({ ...r, biaya: (r.totalBerhasil || 0) * BROADCAST_COST_PER_MESSAGE }));
+}
+
+// Riwayat HARIAN jumlah balasan manual (chat bebas), dengan hitungan kuota
+// gratis 1000 pesan/bulan kalender WIB secara KUMULATIF. Supaya kumulatif per
+// bulan tetap benar walau tampilan cuma "N hari terakhir" (bisa jatuh di
+// pertengahan bulan), data ditarik dari AWAL BULAN yang mencakup rentang
+// tersebut, baru dipotong ke N hari terakhir setelah kumulatifnya dihitung.
+function getManualReplyDailyHistory(days) {
+  const todayWib   = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const rangeStart = new Date(todayWib.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
+  const monthStartWib = new Date(Date.UTC(rangeStart.getUTCFullYear(), rangeStart.getUTCMonth(), 1));
+  const monthStartIso = new Date(monthStartWib.getTime() - 7 * 60 * 60 * 1000).toISOString();
+
+  const rows = db.prepare(`
+    SELECT date(c.time, '+7 hours') AS date, COUNT(*) AS total
+    FROM contacts c
+    JOIN sessions s ON s.id = c.sessionId
+    WHERE s.templateName IN (${MANUAL_REPLY_PLACEHOLDERS})
+      AND c.time >= ?
+    GROUP BY date
+    ORDER BY date ASC
+  `).all(...MANUAL_REPLY_TEMPLATES, monthStartIso);
+
+  const monthCumulative = {};
+  const withQuota = rows.map(r => {
+    const monthKey = r.date.slice(0, 7); // YYYY-MM
+    const before = monthCumulative[monthKey] || 0;
+    const after  = before + r.total;
+    monthCumulative[monthKey] = after;
+    const freeUsed = Math.max(0, Math.min(r.total, MANUAL_REPLY_FREE_QUOTA - before));
+    const billed   = r.total - freeUsed;
+    return { date: r.date, total: r.total, cumulativeBulanIni: after, freeUsed, billed, biaya: billed * BROADCAST_COST_PER_MESSAGE };
+  });
+
+  return withQuota.slice().reverse().slice(0, days); // terbaru dulu, dipotong sesuai rentang diminta
+}
+
+// Riwayat BULANAN jumlah balasan manual — kuota gratis 1000/bulan dihitung
+// per bulan kalender (tidak kumulatif lintas bulan, reset tiap bulan baru).
+function getManualReplyMonthlyHistory(months) {
+  const rows = db.prepare(`
+    SELECT strftime('%Y-%m', c.time, '+7 hours') AS date, COUNT(*) AS total
+    FROM contacts c
+    JOIN sessions s ON s.id = c.sessionId
+    WHERE s.templateName IN (${MANUAL_REPLY_PLACEHOLDERS})
+    GROUP BY date
+    ORDER BY date DESC
+    LIMIT ?
+  `).all(...MANUAL_REPLY_TEMPLATES, months);
+  return rows.map(r => {
+    const freeUsed = Math.min(r.total, MANUAL_REPLY_FREE_QUOTA);
+    const billed   = Math.max(r.total - MANUAL_REPLY_FREE_QUOTA, 0);
+    return { ...r, freeUsed, billed, biaya: billed * BROADCAST_COST_PER_MESSAGE };
+  });
 }
 
 // Format waktu ISO (UTC) → string tanggal+jam WIB "dd/mm/yyyy HH:MM", dipakai
@@ -1059,6 +1120,21 @@ app.get('/api/dashboard/broadcast-history', (req, res) => {
     const maxLimit = groupBy === 'month' ? 24 : 365;
     const days = Math.min(Math.max(parseInt(req.query.days) || 14, 1), maxLimit);
     res.json({ days, groupBy, rows: getBroadcastDailyHistory(days, groupBy) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Riwayat jumlah balasan manual per hari/bulan, plus kuota gratis WA (1000
+// pesan pertama/bulan gratis, selebihnya Rp 365/pesan) — dipakai kartu
+// "Riwayat Balasan Manual" di dashboard.
+app.get('/api/dashboard/manual-reply-history', (req, res) => {
+  try {
+    const groupBy = req.query.groupBy === 'month' ? 'month' : 'day';
+    const maxLimit = groupBy === 'month' ? 24 : 365;
+    const days = Math.min(Math.max(parseInt(req.query.days) || 14, 1), maxLimit);
+    const rows = groupBy === 'month' ? getManualReplyMonthlyHistory(days) : getManualReplyDailyHistory(days);
+    res.json({ days, groupBy, freeQuota: MANUAL_REPLY_FREE_QUOTA, costPerMessage: BROADCAST_COST_PER_MESSAGE, rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1587,6 +1663,22 @@ app.post('/api/reply', async (req, res) => {
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 16 * 1024 * 1024 } });
 
+// Folder untuk menyimpan file yang diupload dari tombol attach di chat, supaya
+// bisa diberi URL publik (di-serve otomatis lewat express.static(public) yang
+// sudah ada di atas) — Maxchat TIDAK punya endpoint untuk terima file base64
+// langsung (endpoint '/api/v1/messages/send-media' yang lama itu tidak ada di
+// API Maxchat, makanya selalu gagal dengan "Cannot POST"). Solusinya: simpan
+// filenya sendiri, lalu kirim URL-nya lewat endpoint yang SUDAH terbukti
+// jalan (sendMediaMessage, dipakai juga oleh /api/reply-media).
+const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+function getPublicBaseUrl(req) {
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const host  = req.headers['x-forwarded-host']  || req.get('host');
+  return `${proto}://${host}`;
+}
+
 app.post('/api/reply-media-upload', (req, res) => {
   upload.single('file')(req, res, async (err) => {
     if (err) return res.json({ error: 'Upload gagal: ' + err.message });
@@ -1601,15 +1693,14 @@ app.post('/api/reply-media-upload', (req, res) => {
     if (!phone) return res.json({ error: 'Nomor tidak valid' });
 
     try {
-      const b64     = req.file.buffer.toString('base64');
       const mime    = req.file.mimetype;
       const isVideo = mime.startsWith('video/');
-      const apiRes  = await axios.post('https://app.maxchat.id/api/v1/messages/send-media', {
-        to:      phone + '@c.us',
-        type:    isVideo ? 'video' : 'image',
-        media:   { base64: b64, filename: req.file.originalname, mimeType: mime },
-        caption,
-      }, { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } });
+      const ext     = path.extname(req.file.originalname) || (isVideo ? '.mp4' : '.jpg');
+      const fileName = 'reply_' + Date.now() + '_' + Math.random().toString(36).slice(2) + ext;
+      fs.writeFileSync(path.join(UPLOADS_DIR, fileName), req.file.buffer);
+      const fileUrl = `${getPublicBaseUrl(req)}/uploads/${fileName}`;
+
+      const data = await sendMediaMessage(phone, fileUrl, isVideo ? 'video' : 'image', caption, token);
 
       markSentByApp(phone, caption || req.file.originalname);
       appendSession({
@@ -1618,10 +1709,15 @@ app.post('/api/reply-media-upload', (req, res) => {
         previewText:  caption || req.file.originalname,
         woCategory:   getLastCategory(phone), 
         summary: { total: 1, success: 1, failed: 0 },
-        contacts: [{ phone, status: 'success', message: caption || req.file.originalname, messageId: apiRes.data.id || '', time: new Date().toISOString() }],
+        contacts: [{
+          phone, status: 'success', message: caption || req.file.originalname,
+          msgType: isVideo ? 'video' : 'image', attachmentUrl: fileUrl,
+          messageId: data.id || data.messageId || '', time: new Date().toISOString(),
+        }],
       });
       res.json({ success: true });
     } catch (e) {
+      console.error('reply-media-upload error:', e.response?.data || e.message);
       res.json({ error: e.response?.data?.message || e.message || 'Gagal kirim file' });
     }
   });
@@ -2897,6 +2993,34 @@ hr{border:none;border-top:1px solid var(--hr-color);margin:11px 0}
           </div>
 
           <div class="card">
+            <div class="card-hd"><i data-lucide="message-square-reply"></i>Riwayat Balasan Manual</div>
+            <div class="card-sub">Jumlah balasan manual (chat bebas) per hari/bulan. Aturan WA: <strong>1000 pesan pertama/bulan gratis</strong>, selebihnya kena biaya <strong>Rp 365/pesan</strong>.</div>
+            <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px">
+              <div class="settings-input-group" style="margin-bottom:0;flex:1;min-width:160px">
+                <label>Rentang</label>
+                <select id="mrHistoryRange" onchange="loadManualReplyHistory()">
+                  <option value="7">7 hari terakhir</option>
+                  <option value="14" selected>14 hari terakhir</option>
+                  <option value="30">30 hari terakhir</option>
+                  <option value="90">90 hari terakhir</option>
+                </select>
+              </div>
+              <div class="input-type-toggle" style="margin-bottom:2px">
+                <button type="button" class="toggle-btn active" id="mrGroupDayBtn" onclick="setMrGroupBy('day')">Harian</button>
+                <button type="button" class="toggle-btn" id="mrGroupMonthBtn" onclick="setMrGroupBy('month')">Bulanan</button>
+              </div>
+            </div>
+            <div id="mrQuotaBox" class="field-hint" style="margin-bottom:8px"></div>
+            <div style="max-height:280px;overflow-y:auto" id="mrHistoryWrap">
+              <table class="log-table">
+                <thead><tr><th>Tanggal</th><th>Total Balasan</th><th>Gratis</th><th>Kena Biaya</th><th>Biaya</th></tr></thead>
+                <tbody id="mrHistoryBody"><tr><td colspan="5" class="empty">Memuat...</td></tr></tbody>
+              </table>
+            </div>
+            <div style="margin-top:10px" class="field-hint" id="mrHistoryTotalCost"></div>
+          </div>
+
+          <div class="card">
             <div class="card-hd"><i data-lucide="file-down"></i>Export Data Broadcast</div>
             <div class="card-sub">Unduh detail per nomor (tanggal, nomor telepon, isi pesan/template, status pengiriman) untuk rentang tanggal tertentu.</div>
 
@@ -3065,8 +3189,8 @@ hr{border:none;border-top:1px solid var(--hr-color);margin:11px 0}
   </div>
 </div>
 
-<div id="lightboxOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:9999;align-items:center;justify-content:center;cursor:zoom-out" onclick="closeLightbox()">
-  <img id="lightboxImg" src="" alt="" style="max-width:92vw;max-height:92vh;border-radius:8px;object-fit:contain;box-shadow:0 8px 40px rgba(0,0,0,.6)">
+<div id="lightboxOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:9999;align-items:center;justify-content:center;cursor:default" onclick="closeLightbox()">
+  <img id="lightboxImg" src="" alt="" draggable="true" style="max-width:92vw;max-height:92vh;border-radius:8px;object-fit:contain;box-shadow:0 8px 40px rgba(0,0,0,.6);transform-origin:0 0" onmousedown="handleLightboxImgMouseDown(event)" onclick="handleLightboxImgClick(event)">
   <video id="lightboxVideo" src="" controls autoplay style="display:none;max-width:92vw;max-height:92vh;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6)" onclick="event.stopPropagation()"></video>
   <button onclick="closeLightbox()" style="position:fixed;top:16px;right:20px;background:rgba(255,255,255,.15);border:none;color:#fff;font-size:22px;width:36px;height:36px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center">✕</button>
 </div>
@@ -3097,8 +3221,40 @@ let loadingSearchMore = false;
 let currentSearchQuery = '';
 let currentRenderedContacts = []; 
 let quickReplies = []; 
+let lbZoom = 1;          // level zoom lightbox gambar (1 = normal, maks 10)
+let lbPanX = 0, lbPanY = 0; // pergeseran (pan) gambar saat di-zoom
+let lbIsDragging = false;   // sedang menggeser gambar?
+let lbDragged = false;      // apakah drag beneran terjadi (bukan sekadar klik)
+let lbDragStartX = 0, lbDragStartY = 0;
+let lbPanStartX = 0, lbPanStartY = 0;
 
 function refreshIcons(){ if (window.lucide) lucide.createIcons(); }
+
+// ============================================================
+// AUTO-REDIRECT KE LOGIN SAAT SESI HABIS
+// ============================================================
+// Middleware requireLogin di server sudah membalas 401 untuk request
+// /api/* kalau sesi habis, tapi sebelumnya tidak ada yang membaca status
+// itu di frontend — response 401 cuma di-JSON-kan dan dipakai seolah data
+// biasa, jadi tampilan diam sampai user refresh manual.
+// Solusi: bungkus fetch bawaan browser sekali di sini. Semua pemanggilan
+// fetch('/api/...') yang sudah ada di file ini (polling, load data, dsb)
+// otomatis kebagian pengecekan ini tanpa perlu diubah satu-satu.
+(function () {
+  const originalFetch = window.fetch;
+  window.fetch = async function (...args) {
+    const res = await originalFetch(...args);
+    if (res.status === 401) {
+      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+      // Hanya redirect untuk pemanggilan API — /login sendiri sengaja
+      // dikecualikan di server, jadi tidak akan pernah masuk sini.
+      if (url.startsWith('/api')) {
+        window.location.href = '/login';
+      }
+    }
+    return res;
+  };
+})();
 
 async function init() {
   const savedTheme = localStorage.getItem('mcTheme') || 'light';
@@ -3230,8 +3386,10 @@ function openMedia(el, kind) {
   const img   = document.getElementById('lightboxImg');
   const video = document.getElementById('lightboxVideo');
   if (!lb || !img || !video) { window.open(src, '_blank'); return; }
+  // reset zoom & pan tiap kali lightbox dibuka
+  lbZoom = 1; lbPanX = 0; lbPanY = 0; lbIsDragging = false; lbDragged = false;
   if (type === 'video') {
-    img.style.display = 'none'; img.src = '';
+    img.style.display = 'none'; img.src = ''; img.style.transform = '';
     video.style.display = 'block';
     video.src = src;
     video.currentTime = 0;
@@ -3240,22 +3398,121 @@ function openMedia(el, kind) {
     video.pause(); video.removeAttribute('src'); video.load(); video.style.display = 'none';
     img.style.display = 'block';
     img.src = src;
+    applyLightboxTransform();
+    updateLightboxImgCursor();
   }
   lb.style.display = 'flex';
   document.body.style.overflow = 'hidden';
 }
-function openVideoLightbox(btn) {
-  const wrap = btn.closest('.video-thumb-wrap');
-  const vid  = wrap?.querySelector('video');
-  if (vid) openMedia(vid, 'video');
+// Klik badan video thumbnail di chat: kalau klik di luar area control bar (bawah video)
+// maka buka lightbox fullscreen; kalau klik di area control bar, biarkan browser yang menangani (play/pause/seek dst)
+// Klik area peta lokasi di chat bubble: buka link Google Maps di tab baru
+function handleLocationMapClick(el) {
+  const url = el.getAttribute('data-maps-url');
+  if (url) window.open(url, '_blank');
+}
+function handleChatVideoClick(event, videoEl) {
+  const rect = videoEl.getBoundingClientRect();
+  const clickY = event.clientY - rect.top;
+  const CONTROL_BAR_HEIGHT = 40; // perkiraan tinggi control bar native browser di bagian bawah video
+  if (clickY < rect.height - CONTROL_BAR_HEIGHT) {
+    openMedia(videoEl, 'video');
+  }
+}
+// Terapkan transform (pan + zoom) saat ini ke gambar lightbox
+function applyLightboxTransform() {
+  const img = document.getElementById('lightboxImg');
+  if (img) img.style.transform = 'translate(' + lbPanX + 'px,' + lbPanY + 'px) scale(' + lbZoom + ')';
+}
+function updateLightboxImgCursor() {
+  const img = document.getElementById('lightboxImg');
+  if (!img) return;
+  img.style.cursor = lbIsDragging ? 'grabbing' : (lbZoom > 1 ? 'grab' : 'default');
+  // draggable="true" hanya saat belum di-zoom, supaya gambar tetap bisa diseret (drag) keluar ke aplikasi lain;
+  // saat sudah di-zoom, draggable dimatikan supaya drag dipakai untuk pan (geser) bukan drag-keluar-aplikasi
+  img.draggable = (lbZoom <= 1);
+}
+// Scroll di atas gambar lightbox: scroll up = zoom in, scroll down = zoom out, terpusat ke posisi kursor
+function handleLightboxWheel(event) {
+  const img = document.getElementById('lightboxImg');
+  if (!img || img.style.display === 'none') return; // hanya berlaku untuk mode gambar
+  event.preventDefault();
+  const rect = img.getBoundingClientRect();
+  const oldZoom = lbZoom;
+  const factor = event.deltaY < 0 ? 1.15 : (1 / 1.15);
+  const newZoom = Math.min(10, Math.max(1, oldZoom * factor));
+  if (newZoom === oldZoom) return;
+
+  const cx = event.clientX - rect.left;
+  const cy = event.clientY - rect.top;
+  const fracX = cx / rect.width;
+  const fracY = cy / rect.height;
+  const baseWidth  = rect.width / oldZoom;
+  const baseHeight = rect.height / oldZoom;
+  const newWidth  = baseWidth * newZoom;
+  const newHeight = baseHeight * newZoom;
+  const originalLeft = rect.left - lbPanX;
+  const originalTop  = rect.top - lbPanY;
+
+  lbZoom = newZoom;
+  if (newZoom === 1) {
+    // kembali ke ukuran normal → snap ke tengah (dikelola flex, tidak perlu pan)
+    lbPanX = 0; lbPanY = 0;
+  } else {
+    lbPanX = (event.clientX - fracX * newWidth) - originalLeft;
+    lbPanY = (event.clientY - fracY * newHeight) - originalTop;
+  }
+  applyLightboxTransform();
+  updateLightboxImgCursor();
+}
+// Mulai drag (pan) gambar lightbox saat sedang di-zoom
+function handleLightboxImgMouseDown(event) {
+  if (lbZoom <= 1) return; // tidak perlu geser kalau belum di-zoom
+  event.preventDefault();
+  lbIsDragging = true;
+  lbDragged = false;
+  lbDragStartX = event.clientX;
+  lbDragStartY = event.clientY;
+  lbPanStartX = lbPanX;
+  lbPanStartY = lbPanY;
+  updateLightboxImgCursor();
+}
+document.addEventListener('mousemove', function (event) {
+  if (!lbIsDragging) return;
+  const dx = event.clientX - lbDragStartX;
+  const dy = event.clientY - lbDragStartY;
+  if (Math.abs(dx) > 3 || Math.abs(dy) > 3) lbDragged = true;
+  lbPanX = lbPanStartX + dx;
+  lbPanY = lbPanStartY + dy;
+  applyLightboxTransform();
+});
+document.addEventListener('mouseup', function () {
+  if (!lbIsDragging) return;
+  lbIsDragging = false;
+  updateLightboxImgCursor();
+});
+// Cegah klik lightbox menutup dirinya sendiri kalau klik itu adalah akhir dari sebuah drag/pan
+function handleLightboxImgClick(event) {
+  if (lbDragged) {
+    event.stopPropagation();
+    lbDragged = false;
+  }
 }
 function closeLightbox() {
   const lb    = document.getElementById('lightboxOverlay');
   const video = document.getElementById('lightboxVideo');
+  const img   = document.getElementById('lightboxImg');
   if (video) { video.pause(); video.removeAttribute('src'); video.load(); } // hentikan pemutaran & lepas koneksi network saat ditutup
+  // reset zoom & pan tiap kali lightbox ditutup
+  lbZoom = 1; lbPanX = 0; lbPanY = 0; lbIsDragging = false; lbDragged = false;
+  if (img) { img.style.transform = ''; img.style.cursor = 'default'; img.draggable = true; }
   if (lb) lb.style.display = 'none';
   document.body.style.overflow = '';
 }
+(function initLightboxWheel() {
+  const lb = document.getElementById('lightboxOverlay');
+  if (lb) lb.addEventListener('wheel', handleLightboxWheel, { passive: false });
+})();
 function mediaFallback(el) {
   const src = el.src || el.currentSrc || '';
   const fname = src.split('/').pop().split('?')[0] || 'file';
@@ -3305,7 +3562,7 @@ function showPage(name, el) {
   document.getElementById('topbarTitle').textContent = map[name][0];
   document.getElementById('topbarSub').textContent   = map[name][1];
   if (name === 'template') renderTemplatePage();
-  if (name === 'dashboard') { refreshSystemInfo(); loadBroadcastHistory(); loadFrequentReporters(); loadWoTrendChart(); }
+  if (name === 'dashboard') { refreshSystemInfo(); loadBroadcastHistory(); loadManualReplyHistory(); loadFrequentReporters(); loadWoTrendChart(); }
   if (name === 'kontak') loadKontakPage();
   if (name === 'chat') {
     document.querySelectorAll('.nav-badge').forEach(b => b.remove());
@@ -4056,8 +4313,7 @@ function renderMessageBubbles(msgs) {
         mediaHtml = '<div style="margin-bottom:4px"><img src="' + safeUrl + '" alt="foto" style="max-width:220px;max-height:220px;border-radius:6px;display:block;cursor:pointer;object-fit:cover" onclick="openMedia(this)" onerror="mediaFallback(this)"></div>';
       } else if (mtype === 'video' || /\\.(mp4|mov|avi|mkv)(\\?|$)/i.test(url)) {
         mediaHtml = '<div class="video-thumb-wrap" style="margin-bottom:4px;position:relative;display:inline-block">'
-          + '<video src="' + safeUrl + '" controls style="max-width:220px;max-height:180px;border-radius:6px;display:block" onerror="mediaFallback(this)"></video>'
-          + '<button type="button" onclick="event.stopPropagation();openVideoLightbox(this)" title="Perbesar" style="position:absolute;top:5px;right:5px;width:24px;height:24px;border-radius:6px;border:none;background:rgba(0,0,0,.55);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px;line-height:1;padding:0">⛶</button>'
+          + '<video src="' + safeUrl + '" controls style="max-width:220px;max-height:200px;border-radius:6px;display:block;cursor:pointer" onclick="handleChatVideoClick(event,this)" onerror="mediaFallback(this)"></video>'
           + '</div>';
       } else if (mtype === 'audio' || mtype === 'voice' || /\\.(ogg|mp3|m4a|aac|wav)(\\?|$)/i.test(url)) {
         mediaHtml = '<div style="margin-bottom:4px"><audio src="' + safeUrl + '" controls style="max-width:220px;height:36px" onerror="mediaFallback(this)"></audio></div>';
@@ -4067,12 +4323,26 @@ function renderMessageBubbles(msgs) {
       }
     }
     const captionHtml = (escaped && escaped !== '[' + mtype + ']') ? '<div>' + escaped + '</div>' : (!url ? '<div>' + escaped + '</div>' : '');
+
+    // Pesan lokasi: tampilkan visual peta (embed Google Maps) di bawah teks keterangan.
+    // Klik area peta membuka Google Maps di tab baru; teks keterangan di atas tetap teks biasa (bisa di-copy).
+    let locationHtml = '';
+    const geoMatch = (mtype === 'location') && (m.text || '').match(/maps\\.google\\.com\\/\\?q=(-?\\d+(?:\\.\\d+)?),(-?\\d+(?:\\.\\d+)?)/);
+    if (geoMatch) {
+      const lat = geoMatch[1], lng = geoMatch[2];
+      const mapsLink  = 'https://maps.google.com/?q=' + lat + ',' + lng;
+      const embedSrc  = 'https://www.google.com/maps?q=' + lat + ',' + lng + '&output=embed';
+      locationHtml = '<div style="margin-top:4px;position:relative;width:220px;height:150px;border-radius:6px;overflow:hidden">'
+        + '<iframe src="' + embedSrc + '" style="width:100%;height:100%;border:0" loading="lazy"></iframe>'
+        + '<div data-maps-url="' + mapsLink + '" onclick="handleLocationMapClick(this)" title="Buka di Google Maps" style="position:absolute;inset:0;cursor:pointer"></div>'
+        + '</div>';
+    }
     const metaSpan = '<span>' + ts + (m.nomerLapor ? ' · 📋 ' + m.nomerLapor : '') + (m.templateName && !isIn ? ' · ' + m.templateName : '') + '</span>';
     const tickSpan = !isIn ? '<span class="chat-bubble-status ' + (isPending ? 'pending' : (ok?'ok':'err')) + '">' + (isPending ? '🕐' : (ok?'✓✓':'✗')) + '</span>' : '';
     return dateSepHtml
       + '<div class="chat-msg-bubble' + (isPending ? ' pending' : '') + '" style="justify-content:' + (isIn?'flex-start':'flex-end') + '">'
       + '<div class="' + (isIn ? 'chat-bubble-in' : 'chat-bubble-out') + '">'
-      + mediaHtml + captionHtml
+      + mediaHtml + captionHtml + locationHtml
       + '<div class="chat-bubble-meta">' + metaSpan + tickSpan + '</div>'
       + '</div></div>';
   }).join('');
@@ -4443,6 +4713,72 @@ async function loadBroadcastHistory() {
     if (totalEl) totalEl.textContent = 'Total biaya ' + label + ' (hanya broadcast berhasil): ' + formatRupiah(totalCost) + ' (Rp 365/broadcast)';
   } catch (e) {
     body.innerHTML = '<tr><td colspan="6" class="empty">Gagal memuat data.</td></tr>';
+    if (totalEl) totalEl.textContent = '';
+  }
+}
+
+let mrGroupBy = 'day';
+function setMrGroupBy(mode) {
+  mrGroupBy = mode;
+  document.getElementById('mrGroupDayBtn').classList.toggle('active', mode === 'day');
+  document.getElementById('mrGroupMonthBtn').classList.toggle('active', mode === 'month');
+  const rangeSel = document.getElementById('mrHistoryRange');
+  if (rangeSel) {
+    rangeSel.innerHTML = mode === 'month'
+      ? '<option value="3">3 bulan terakhir</option><option value="6" selected>6 bulan terakhir</option><option value="12">12 bulan terakhir</option><option value="24">24 bulan terakhir</option>'
+      : '<option value="7">7 hari terakhir</option><option value="14" selected>14 hari terakhir</option><option value="30">30 hari terakhir</option><option value="90">90 hari terakhir</option>';
+  }
+  loadManualReplyHistory();
+}
+
+async function loadManualReplyHistory() {
+  const body    = document.getElementById('mrHistoryBody');
+  const totalEl = document.getElementById('mrHistoryTotalCost');
+  const quotaEl = document.getElementById('mrQuotaBox');
+  const days = document.getElementById('mrHistoryRange')?.value || (mrGroupBy === 'month' ? 6 : 14);
+  try {
+    const data = await fetch('/api/dashboard/manual-reply-history?days=' + days + '&groupBy=' + mrGroupBy).then(r => r.json());
+    const rows = data.rows || [];
+    const quota = data.freeQuota || 1000;
+
+    // Kotak ringkasan kuota bulan berjalan (dihitung dari baris bulan berjalan
+    // kalau groupBy=month, atau dari cumulativeBulanIni baris paling baru kalau groupBy=day).
+    if (quotaEl) {
+      const nowMonthKey = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 7);
+      let terpakai = 0;
+      if (mrGroupBy === 'month') {
+        const rBulanIni = rows.find(r => r.date === nowMonthKey);
+        terpakai = rBulanIni ? rBulanIni.total : 0;
+      } else {
+        const rTerbaru = rows.find(r => r.date.slice(0, 7) === nowMonthKey);
+        terpakai = rTerbaru ? rTerbaru.cumulativeBulanIni : 0;
+      }
+      const sisa = Math.max(quota - terpakai, 0);
+      const lewat = Math.max(terpakai - quota, 0);
+      quotaEl.innerHTML = lewat > 0
+        ? \`Kuota gratis bulan ini: <strong style="color:#991b1b">\${terpakai.toLocaleString('id-ID')} / \${quota.toLocaleString('id-ID')}</strong> — sudah lewat \${lewat.toLocaleString('id-ID')} pesan (kena biaya)\`
+        : \`Kuota gratis bulan ini: <strong>\${terpakai.toLocaleString('id-ID')} / \${quota.toLocaleString('id-ID')}</strong> — sisa \${sisa.toLocaleString('id-ID')} pesan gratis\`;
+    }
+
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty">Belum ada data.</td></tr>';
+      if (totalEl) totalEl.textContent = '';
+      return;
+    }
+    body.innerHTML = rows.map(r => \`
+      <tr>
+        <td>\${formatBcPeriode(r.date)}</td>
+        <td>\${r.total.toLocaleString('id-ID')}</td>
+        <td style="color:#166534;font-weight:600">\${(r.freeUsed||0).toLocaleString('id-ID')}</td>
+        <td style="color:#991b1b;font-weight:600">\${(r.billed||0).toLocaleString('id-ID')}</td>
+        <td>\${formatRupiah(r.biaya)}</td>
+      </tr>
+    \`).join('');
+    const totalCost = rows.reduce((a, r) => a + r.biaya, 0);
+    const label = mrGroupBy === 'month' ? (rows.length + ' bulan terakhir') : (rows.length + ' hari terakhir');
+    if (totalEl) totalEl.textContent = 'Total biaya balasan manual ' + label + ': ' + formatRupiah(totalCost) + ' (Rp 365/pesan di luar 1000 gratis/bulan)';
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">Gagal memuat data.</td></tr>';
     if (totalEl) totalEl.textContent = '';
   }
 }
