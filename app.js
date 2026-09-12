@@ -3398,6 +3398,33 @@ function updateThemeUI(theme) {
   refreshIcons();
 }
 
+// Jaring pengaman global: kalau ada video/audio LAIN (bukan video lightbox) yang mulai
+// main secara native di dalam chat (misal user pencet tombol play di thumbnail),
+// hentikan semua video/audio lain termasuk video lightbox. TAPI kalau yang mulai main
+// itu video lightbox sendiri, listener ini sengaja tidak melakukan apa-apa — supaya
+// proses play video lightbox tidak pernah diinterupsi oleh listener ini.
+// 'play' event tidak bubble, makanya listener dipasang di document dengan capture=true.
+document.addEventListener('play', function (e) {
+  const src = e.target;
+  if (!src || (src.tagName !== 'VIDEO' && src.tagName !== 'AUDIO')) return;
+  const lbVideo = document.getElementById('lightboxVideo');
+  if (src === lbVideo) return; // biarkan video lightbox main tanpa gangguan
+  document.querySelectorAll('video, audio').forEach(function (el) {
+    if (el !== src && !el.paused) el.pause();
+  });
+}, true);
+
+// Klik pada thumbnail video di bubble chat (bukan lewat atribut onclick inline,
+// supaya tidak perlu quote bersarang) — thumbnail ini murni gambar diam + ikon
+// play (elemen <video>-nya tidak punya "controls" dan tidak pernah dipanggil
+// .play()), jadi satu-satunya aksi klik di sini adalah membuka lightbox.
+document.addEventListener('click', function (e) {
+  const wrap = e.target.closest && e.target.closest('.video-thumb-wrap');
+  if (!wrap) return;
+  const vid = wrap.querySelector('video');
+  if (vid) openMedia(vid, 'video');
+});
+
 function openMedia(el, kind) {
   const src  = el.src || el.currentSrc || '';
   const type = kind || (el.tagName === 'VIDEO' ? 'video' : 'image');
@@ -3408,11 +3435,27 @@ function openMedia(el, kind) {
   // reset zoom & pan tiap kali lightbox dibuka
   lbZoom = 1; lbPanX = 0; lbPanY = 0; lbIsDragging = false; lbDragged = false;
   if (type === 'video') {
+    // Video lightbox diprioritaskan untuk main: matikan SEMUA video/audio lain
+    // (thumbnail yang diklik maupun thumbnail lain yang mungkin masih jalan) SEBELUM
+    // lightbox mulai play, secara proaktif — bukan menunggu event, jadi tidak ada
+    // race condition yang bisa ikut menghentikan video lightbox itu sendiri.
+    document.querySelectorAll('video, audio').forEach(function (m) {
+      if (m !== video && !m.paused) m.pause();
+    });
     img.style.display = 'none'; img.src = ''; img.style.transform = '';
     video.style.display = 'block';
     video.src = src;
     video.currentTime = 0;
     video.play().catch(() => {}); // browser bisa menolak autoplay bersuara, tidak masalah — tombol play tetap ada
+    // Jaring pengaman tambahan: di sebagian browser/WebView, native tap-to-play pada
+    // thumbnail bisa lolos lewat touchend dan baru "menyusul" beberapa saat setelah
+    // click ditangani (tidak tercegah oleh preventDefault di 'click'). Pause ulang
+    // semua video/audio SELAIN lightbox sesaat kemudian untuk menutup celah itu.
+    setTimeout(function () {
+      document.querySelectorAll('video, audio').forEach(function (m) {
+        if (m !== video && !m.paused) m.pause();
+      });
+    }, 150);
   } else {
     video.pause(); video.removeAttribute('src'); video.load(); video.style.display = 'none';
     img.style.display = 'block';
@@ -3422,16 +3465,6 @@ function openMedia(el, kind) {
   }
   lb.style.display = 'flex';
   document.body.style.overflow = 'hidden';
-}
-// Klik badan video thumbnail di chat: kalau klik di luar area control bar (bawah video)
-// maka buka lightbox fullscreen; kalau klik di area control bar, biarkan browser yang menangani (play/pause/seek dst)
-function handleChatVideoClick(event, videoEl) {
-  const rect = videoEl.getBoundingClientRect();
-  const clickY = event.clientY - rect.top;
-  const CONTROL_BAR_HEIGHT = 40; // perkiraan tinggi control bar native browser di bagian bawah video
-  if (clickY < rect.height - CONTROL_BAR_HEIGHT) {
-    openMedia(videoEl, 'video');
-  }
 }
 // Terapkan transform (pan + zoom) saat ini ke gambar lightbox
 function applyLightboxTransform() {
@@ -4326,8 +4359,16 @@ function renderMessageBubbles(msgs) {
       if (mtype === 'image' || mtype === 'sticker' || /\\.(jpg|jpeg|png|gif|webp)(\\?|$)/i.test(url)) {
         mediaHtml = '<div style="margin-bottom:4px"><img src="' + safeUrl + '" alt="foto" style="max-width:220px;max-height:220px;border-radius:6px;display:block;cursor:pointer;object-fit:cover" onclick="openMedia(this)" onerror="mediaFallback(this)"></div>';
       } else if (mtype === 'video' || /\\.(mp4|mov|avi|mkv)(\\?|$)/i.test(url)) {
-        mediaHtml = '<div class="video-thumb-wrap" style="margin-bottom:4px;position:relative;display:inline-block">'
-          + '<video src="' + safeUrl + '" controls style="max-width:220px;max-height:200px;border-radius:6px;display:block;cursor:pointer" onclick="handleChatVideoClick(event,this)" onerror="mediaFallback(this)"></video>'
+        // Thumbnail video di bubble chat SENGAJA tidak bisa diputar sama sekali (tanpa
+        // atribut "controls", tanpa pernah dipanggil .play()) — cuma menampilkan frame
+        // pertama sebagai gambar diam + ikon play di atasnya. Satu-satunya tempat video
+        // ini benar-benar bisa diputar (video & suara bareng) adalah di lightbox fullscreen.
+        mediaHtml = '<div class="video-thumb-wrap" style="margin-bottom:4px;position:relative;display:inline-block;cursor:pointer">'
+          + '<video src="' + safeUrl + '" preload="metadata" muted playsinline disablepictureinpicture controlslist="nodownload noplaybackrate" style="max-width:220px;max-height:200px;border-radius:6px;display:block;pointer-events:none" onerror="mediaFallback(this)"></video>'
+          + '<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.22);border-radius:6px;pointer-events:none">'
+          + '<div style="width:46px;height:46px;border-radius:50%;background:rgba(255,255,255,.92);display:flex;align-items:center;justify-content:center;box-shadow:0 2px 10px rgba(0,0,0,.35)">'
+          + '<i data-lucide="play" style="width:20px;height:20px;color:#111;margin-left:3px"></i>'
+          + '</div></div>'
           + '</div>';
       } else if (mtype === 'audio' || mtype === 'voice' || /\\.(ogg|mp3|m4a|aac|wav)(\\?|$)/i.test(url)) {
         mediaHtml = '<div style="margin-bottom:4px"><audio src="' + safeUrl + '" controls style="max-width:220px;height:36px" onerror="mediaFallback(this)"></audio></div>';
