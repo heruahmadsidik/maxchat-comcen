@@ -5,13 +5,25 @@ const fs      = require('fs');
 const path    = require('path');
 const compression = require('compression');
 const session = require('express-session');
+const FileStore = require('session-file-store')(session); // npm install session-file-store — simpan sesi login ke disk (bukan RAM) supaya operator TIDAK ke-logout tiap kali server di-restart (pm2 restart)
 const XLSX    = require('xlsx');
 const app     = express();
 
 app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Folder penyimpanan file sesi login — dibuat sebelum middleware session
+// dipasang di bawah, supaya FileStore langsung punya tempat menulis.
+const SESS_DIR = path.join(__dirname, 'storage', 'sessions');
+if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR, { recursive: true });
+
 app.use(session({
+  store: new FileStore({
+    path: SESS_DIR,
+    ttl: 60 * 60 * 12,   // 12 jam, samakan dengan cookie.maxAge di bawah (dalam detik)
+    retries: 0,          // jangan retry kalau file sesi tidak ketemu (mis. setelah logout) — biar tidak nunggu lama
+  }),
   secret: process.env.SESSION_SECRET || 'nikmatmanalagiyangkamudustakan', // ⚠️ sebaiknya diisi lewat .env
   resave: false,
   saveUninitialized: false,
@@ -231,10 +243,17 @@ function initDb() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_session ON contacts(sessionId)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_time    ON sessions(time DESC)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_phone_time ON contacts(phone, time DESC)`);
+  // Index messageId: dipakai stmt.updateContact (UPDATE ... WHERE messageId = ? AND messageId != ''),
+  // dipanggil tiap webhook status_update (sent/delivered/read) masuk — tanpa ini,
+  // setiap event status memicu full table scan seluruh tabel contacts.
+  // Partial index (skip baris messageId kosong) — query di atas selalu mensyaratkan
+  // messageId != '', jadi baris kosong tidak pernah relevan dicari; index jadi lebih kecil.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_messageid ON contacts(messageId) WHERE messageId != ''`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_summary_time      ON contact_summary(lastTime DESC)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_summary_unread    ON contact_summary(isUnread, lastTime DESC)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_summary_category  ON contact_summary(woCategory, lastTime DESC)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_quick_replies_order ON quick_replies(order_num ASC)`);
+
 
   // ------------------------------------------------------------
   // FTS5: index pencarian teks (nama kontak, isi pesan, preview template)
@@ -3406,11 +3425,6 @@ function openMedia(el, kind) {
 }
 // Klik badan video thumbnail di chat: kalau klik di luar area control bar (bawah video)
 // maka buka lightbox fullscreen; kalau klik di area control bar, biarkan browser yang menangani (play/pause/seek dst)
-// Klik area peta lokasi di chat bubble: buka link Google Maps di tab baru
-function handleLocationMapClick(el) {
-  const url = el.getAttribute('data-maps-url');
-  if (url) window.open(url, '_blank');
-}
 function handleChatVideoClick(event, videoEl) {
   const rect = videoEl.getBoundingClientRect();
   const clickY = event.clientY - rect.top;
@@ -4322,27 +4336,26 @@ function renderMessageBubbles(msgs) {
         mediaHtml = '<div style="margin-bottom:4px"><a href="' + safeUrl + '" target="_blank" style="display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:6px;background:rgba(0,0,0,.15);color:inherit;text-decoration:none;font-size:11px">📄 ' + fname + '</a></div>';
       }
     }
-    const captionHtml = (escaped && escaped !== '[' + mtype + ']') ? '<div>' + escaped + '</div>' : (!url ? '<div>' + escaped + '</div>' : '');
+    let captionHtml = (escaped && escaped !== '[' + mtype + ']') ? '<div>' + escaped + '</div>' : (!url ? '<div>' + escaped + '</div>' : '');
 
-    // Pesan lokasi: tampilkan visual peta (embed Google Maps) di bawah teks keterangan.
-    // Klik area peta membuka Google Maps di tab baru; teks keterangan di atas tetap teks biasa (bisa di-copy).
-    let locationHtml = '';
+    // Pesan lokasi: tidak lagi pakai preview peta (iframe blank & window.open rawan
+    // diblokir popup blocker di mobile/WebView) — cukup jadikan link maps di dalam
+    // teks jadi <a> asli yang bisa diklik & buka tab baru. Teks depan "📍 Lokasi | ..."
+    // (termasuk fallback "Lokasi" kalau nama/alamat kosong dari sananya) tidak diubah sama sekali.
     const geoMatch = (mtype === 'location') && (m.text || '').match(/maps\\.google\\.com\\/\\?q=(-?\\d+(?:\\.\\d+)?),(-?\\d+(?:\\.\\d+)?)/);
     if (geoMatch) {
       const lat = geoMatch[1], lng = geoMatch[2];
-      const mapsLink  = 'https://maps.google.com/?q=' + lat + ',' + lng;
-      const embedSrc  = 'https://www.google.com/maps?q=' + lat + ',' + lng + '&output=embed';
-      locationHtml = '<div style="margin-top:4px;position:relative;width:220px;height:150px;border-radius:6px;overflow:hidden">'
-        + '<iframe src="' + embedSrc + '" style="width:100%;height:100%;border:0" loading="lazy"></iframe>'
-        + '<div data-maps-url="' + mapsLink + '" onclick="handleLocationMapClick(this)" title="Buka di Google Maps" style="position:absolute;inset:0;cursor:pointer"></div>'
-        + '</div>';
+      const mapsLink = 'https://maps.google.com/?q=' + lat + ',' + lng;
+      const linkHtml = '<a href="' + mapsLink + '" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">' + mapsLink + '</a>';
+      captionHtml = captionHtml.split(mapsLink).join(linkHtml);
     }
+
     const metaSpan = '<span>' + ts + (m.nomerLapor ? ' · 📋 ' + m.nomerLapor : '') + (m.templateName && !isIn ? ' · ' + m.templateName : '') + '</span>';
     const tickSpan = !isIn ? '<span class="chat-bubble-status ' + (isPending ? 'pending' : (ok?'ok':'err')) + '">' + (isPending ? '🕐' : (ok?'✓✓':'✗')) + '</span>' : '';
     return dateSepHtml
       + '<div class="chat-msg-bubble' + (isPending ? ' pending' : '') + '" style="justify-content:' + (isIn?'flex-start':'flex-end') + '">'
       + '<div class="' + (isIn ? 'chat-bubble-in' : 'chat-bubble-out') + '">'
-      + mediaHtml + captionHtml + locationHtml
+      + mediaHtml + captionHtml
       + '<div class="chat-bubble-meta">' + metaSpan + tickSpan + '</div>'
       + '</div></div>';
   }).join('');
